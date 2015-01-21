@@ -1,0 +1,54 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+#           NAME: vkAudioDumpLinkWrapper
+#    DESCRIPTION: Wrapper script for vkAudioDump for download
+#                 audio records in one key stroke.
+#          USAGE: Copy link with audio records you want download
+#                 and press key combination to which script assigned.
+#         AUTHOR: bosha
+#       REQUIRES: xclip/xsel
+#        WEBSITE: http://the-bosha.ru
+#        LICENSE: GNU GPLv2
+# -----------------------------------------------------------------------------
+
+# E-Mail
+EMAIL=""
+# Password
+PASS=""
+# Directory, where to store downloaded records
+DIRECTORY=""
+
+if [[ -z "$EMAIL" ]] || [[ -z "$PASS" ]]; then
+    echo "You should specify e-mail and password in script variables"
+    exit 1
+fi
+
+cmd=$(which xsel)
+if [[ -z "$cmd" ]]; then
+    cmd=$(which xclip)
+    if [[ -z "$cmd" ]]; then
+        echo "No xclip/xsel found in system. Install them first"
+        exit 1
+    else
+        link=$($cmd -o)
+    fi
+else
+    link=$($cmd -p)
+fi
+
+if [[ ! $link =~ ^(http(s)?:\/\/)?vk(ontakte)?.(com|ru)\/ ]]; then
+    echo "Bad URL specified"
+    exit 1
+fi
+
+if [[ ! -z "$DIRECTORY" ]]; then
+    ./vkAudioDump --email $EMAIL \
+                  --password $PASS \
+                  --from-url $link \
+                  --directory $DIRECTORY
+else
+    ./vkAudioDump --email $EMAIL \
+                  --password $PASS \
+                  --from-url $link
+fi
+

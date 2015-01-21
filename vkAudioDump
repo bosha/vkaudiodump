@@ -1,0 +1,475 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+#           NAME: vkAudioDump
+#    DESCRIPTION: Script for downloading audio audio records
+#                 from popular in Russia social network vk.com
+#          USAGE: See README.md or vkAudioDump --help
+#         AUTHOR: bosha
+#        WEBSITE: http://the-bosha.ru
+#        LICENSE: GNU GPLv2
+# -----------------------------------------------------------------------------
+
+# Variables {{{
+
+# Editable variables
+# -----------------------------------------------------------------------------
+# User email (login)
+u_mail=''
+
+# User password
+u_password=''
+
+# Proxy string. (Long line in *nix format). 
+# For example: http://username:password@host.com:23"
+proxy_string=""
+
+# Default directory where to store downloaded audio records
+dump_directory=""
+
+# "System" variables. Typically, you don't need change them
+# -----------------------------------------------------------------------------
+pid_file=""
+current_pid=""
+force_override=false
+flag_sync=false
+flag_quite=false
+processed_records=""
+dont_download=false
+records_list=""
+session_downloaded_records=""
+last_session_downloaded_records=""
+cookie_file="$HOME/.vkAudioDump.cookie"
+u_id=''
+
+# }}}
+
+try() { # {{{
+    cmd="$*" ;
+    msg=$($cmd 2>&1)
+    [ $? -ne 0 ] && die "Error: ${msg}" "$?"
+    return $?
+} # }}}
+
+run() { # {{{
+    local command="$*";
+    local msg=$($command 2>&1)
+    return $?
+} #}}}
+
+trim() { # {{{
+    if [[ ! -z "$@" ]]; then
+        echo "$@" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+    else
+        while read data; do
+            echo $data | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+        done
+    fi
+} # }}}
+
+have () { # {{{
+    (which "$1" &> /dev/null) \
+        && return 0 || return 1
+} #}}}
+
+notify () { # {{{
+    ( "$flag_quite" ) && return
+    if [[ ! -z "$osdnotify" ]] && (have "notify-send"); then
+        notify-send "vkAudioDump" "$1" \
+            -u normal \
+            -i gtk-dialog-warning \
+            -t 8000
+    else
+        echo "$1"
+    fi
+} #}}}
+
+urldecode() { # {{{
+    # Add here if found more symbols
+    echo "$1" |
+    sed -e "\
+        s/\&#39;/'/g ; s/\&#9835;//g
+    "
+} # }}}
+
+die() { # {{{
+    notify "$1"
+    if [[ ! -z "$2" ]]; then
+        exit $2
+    fi
+    exit 1
+} # }}}
+
+getPage() { # {{{
+    local page="$1"
+    local params="$2"
+    local output=$(wget -q -T 5 -t 3 --load-cookies "$cookie_file" -O- https://vk.com/"$page")
+
+    [[ "$?" -ne 0 ]] && \
+        die "Network error: vk.com not available. Check your internet connection"
+
+    echo "$output"
+} # }}}
+
+getXMLPage() { # {{{
+    local page="$1"
+    local id="$2"
+    local gid="$3"
+    local output=$(wget -q -T 5 -t 3 --load-cookies "$cookie_file" \
+                    --post-data="act=load_audios_silent&al=1&gid=$gid&id=$id&please_dont_ddos=2" \
+                    --header="X-Requested-With: XMLHttpRequest" \
+                    -O - https://vk.com/"$page")
+
+    [[ "$?" -ne 0 ]] && \
+        die "Network error: vk.com not available. Check your internet connection"
+
+    echo "$output"
+} # }}}
+
+emergStop() { # {{{
+    [[ ! -z "$current_downloaded_record" ]] \
+        && rm "$dump_directory"/"$current_downloaded_record" &> /dev/null
+
+    if ( "$flag_sync" ); then
+        if [[ ! -z "$session_downloaded_records" ]]; then
+            if [[ ! -z "$last_session_downloaded_records" ]]; then
+                echo "$session_downloaded_records" > last.dump
+                echo "$last_session_downloaded_records" >> last.dump
+            else
+                echo "$session_downloaded_records" > last.dump
+            fi
+        else
+            echo "$last_session_downloaded_records" > last.dump
+        fi
+    fi
+    exit
+} # }}}
+
+normalStop() { # {{{
+    if [[ -f "$pid_file" ]]; then
+        pid=$(cat "$pid_file")
+        if [[ "$pid" -eq "$current_pid" ]]; then
+            run rm "$pid_file"
+        fi
+    fi
+} # }}}
+
+downloadRecord() { # {{{
+    current_downloaded_record="$1"
+    wget -T 5 -t 3 -q -O "$1" "$2"
+    [[ "$?" -ne 0 ]] && \
+        die "Network error: vk.com not available. Check your internet connection"
+} # }}}
+
+usage() { # {{{
+     cat << EOF
+
+usage: "$0" --email [EMAIL] --password [PASSWORD] ... [OPTIONS]
+Script for downloading audio records from vk.com social network
+
+OPTIONS:
+-h,--help       Show this help
+-e,--email      Specify email
+-p,--password   Specify password
+-d,--directory  Directory to where download records
+-O,--override   Override already downloaded records if found
+-q,--quite      Suppress any output
+-P,--proxy      Specify proxy string (e.g., http://login:pass@host.com:23)
+-N,--notreally  Don't download records, just print them out
+-f,--from-url   Download records from given url (can be group/user/playlist)
+-o,--osdnotify  Use notify-osd for script notifications
+--sync          Download only new records
+--group         Group which records will be downloaded
+--user          User which records will be downloaded
+--playlist      Playlist ID to download
+--cookie        Use exists vk.com cookie
+EOF
+die "" 0
+} # }}}
+
+getRawRecordsList() { # {{{
+    group="$(echo "$download_uri" | grep -o "audios-[0-9]*" | grep -o "[0-9]*")"
+    user="$(echo "$download_uri" | grep -o "audios[0-9]*" | grep -o "[0-9]*")"
+    name_or_id=$(echo "$download_uri" | grep -o "^\(id[0-9]*\|[A-Za-z0-9_]*\)")
+    album="$(echo "$download_uri" | grep -o "album_id=[0-9]*" | grep -o "[0-9]*")"
+    page=$(echo "$download_uri" | grep -o "wall.*[0-9]*\_[0-9]*")
+    gid="0"
+    id="0"
+
+    if [[ ! -z "$page" ]]; then
+        notify "Downloading records from specified page: [ $page ]"
+        page=$(getPage "$page" | iconv -f CP1251)
+        page=$(urldecode "$page")
+        names=$(echo "$page" | sed -n 's/.*event)\;\">\(.*\)<\/a><\/b>.*/\1/p')
+        titles=$(echo "$page" | sed -n 's/.*id=\"title.*>\(.*\) <\/span>.*/\1/p')
+        links=$(echo "$page" | sed -n 's/.*value=\"\(.*\)?extra.*/\1/p')
+        count=$(echo "$titles" | wc -l)
+
+        [[ -z "$names" ]] \
+            && die "Something goes wrong while downloading records from given page"
+
+        for ((i=1; i<="$count"; i++ )); do
+            author=$(echo "$names" | sed -n -e "${i}p")
+            title=$(echo "$titles" | sed -n -e "${i}p")
+            link=$(echo "$links" | sed -n -e "${i}p")
+            records_list+=""$author"|"$title"|"$link""$'\n'
+        done
+        return
+    fi
+
+    if [[ ! -z "$name_or_id" ]] && [[ -z "$user" ]] && [[ -z "$group" ]] && [[ -z "$page" ]]; then
+        notify "Getting user ID"
+        user=$(getPage "${name_or_id}" \
+            | grep -o "<a.*module_header" \
+            | grep -o -m 1 "a href=\"/audios[0-9]*" \
+            | grep -o "[0-9]*")
+
+        [[ -z "$user" ]] \
+            && die "Could not read records for specified user id/name"
+    fi
+
+    if [[ ! -z "$user" ]]; then
+        notify "Downloading records of user with id "$id""
+        id="$user"
+    fi
+
+    if [[  ! -z "$group" ]]; then
+        notify "Downloading group records"
+        gid="$group"
+
+    fi
+
+    if [[ -z "$group" ]] && [[ -z "$user" ]] && [[ -z "$page" ]]; then
+        notify "Downloading current user records"
+        user="$u_id"
+        id="$u_id"
+    fi
+
+    raw_records=$(getXMLPage "audio" "$id" "$gid" | iconv -f CP1251)
+    raw_records=$(echo "$raw_records" | sed 's/\]\]\}<!>.*//g;s/^.*\:\[\[//g')
+    raw_records=$(echo "$raw_records" | sed "s/\(?extra=[^']*'\)/'/g")
+    raw_records=$(echo "$raw_records" | sed "s/\],\[/\n/g;s/'//g")
+    raw_records=$(urldecode "$raw_records")
+    raw_records=$(echo "$raw_records")
+
+    [[ -z "$raw_records" ]] \
+        && die "Could not get records list. Something nasty happens!"
+
+    if [[ ! -z "$album" ]] && [[ -z "$page" ]]; then
+        notify "Also downloading album"
+        raw_records=$(echo "$raw_records" | grep "$album")
+    fi
+
+    notify "Converting records list.."
+    while read -r record; do
+        author=$(echo "$record" | awk -F ',' '{print $6}' | trim)
+        name=$(echo "$record" | awk -F ',' '{print $7}' | trim)
+        link=$(echo "$record" | awk -F ',' '{print $3}')
+        line=""$author"|"$name"|"$link""
+        records_list+="$line"$'\n'
+    done <<< "$raw_records"
+    return 0
+} # }}}
+
+main() { # {{{
+
+    if [[ ! -z "$proxy_string" ]]; then
+        notify "Using specified proxy"
+        export http_proxy="$proxy_string"
+        export https_proxy="$proxy_string"
+    fi
+
+    [[ -z "${u_mail}" ]] || [[ -z "${u_password}" ]] \
+        && die "You need to specify email and password. See --help for details."
+
+    notify "Authorizing on vk.com .."
+    if [ ! -f "$cookie_file" ]; then
+
+        notify "No previous authorization found .. "
+
+        ip_h=$(getPage "http://vk.com/login" | \
+                sed -n 's/.*name="ip_h"\s\+value="\([^"]\+\).*/\1/p')
+
+        auth=$(wget -T 5 -t 3 -q -O- --save-cookies \
+            "$cookie_file" \
+            --post-data \
+            "email=$u_mail&pass=$u_password&ip_h=$ip_h" \
+            "https://login.vk.com/?act=login" | grep "logout_link")
+
+        [[ "$?" -ne 0 ]] && \
+            die "Network error: vk.com not available. Check your internet connection"
+
+    else
+        notify "Checking is exists cookie valid.."
+        auth=$(getPage "settings" | grep "logout_link")
+    fi
+
+    if [[ -z "$auth" ]]; then
+        run "rm -rf "$cookie_file""
+        die "Authorization fail!"
+    fi
+
+    u_id=$(sed -n 's/.*l\s//;s/\(^[0-9].*$\)/\1/p' "$cookie_file")
+    pid_file="/tmp/.vkAudioDump_id"$u_id".pid"
+    current_pid=$$
+
+    [[ -f "$pid_file" ]] \
+        && die "An instance of programm already downloading something with such user id."
+
+    echo $current_pid > $pid_file
+
+    notify "Gettings records list"
+    getRawRecordsList
+
+    if [[ -z "$dump_directory" ]] && ( ! "$dont_download" ); then
+        if (run "mkdir -p /home/"$USER"/vkAudioDump/"); then
+            dump_directory="/home/"$USER"/vkAudioDump"
+        else
+            die "Directory not specified && home directory not writeable also"
+        fi
+    else
+        if [[ ! -d "$dump_directory" ]] && ( ! "$dont_download" ); then
+            notify "Directory not exists. Trying to create.."
+            if (run "mkdir -p "$dump_directory""); then
+                notify "Directory successful created"
+            else
+                die "Could not create directory"
+            fi
+        fi
+    fi
+
+    cd "$dump_directory"
+
+    if ( "$flag_sync" ) && [[ ! -z "$page" ]]; then
+        die "Sync option can be used only when synchronizing user records"
+    elif ( "$flag_sync" ) && [[ -z "$page" ]]; then
+        if [[ -f "last.dump" ]]; then
+            notify "Last dump file found. Checking difference.."
+            echo "$records_list" > current.dump
+            difference=$(grep -Fxvf last.dump current.dump)
+            difference=$(echo "$difference" | sed '/^$/d')
+            if [[ ! -z "$difference" ]]; then
+                last_session_downloaded_records=$(cat last.dump)
+                try "mv current.dump last.dump"
+                records_list="$difference"
+            else
+                notify "There is no new records"
+                try "rm current.dump"
+                exit 0
+            fi
+        else
+            echo "$records_list" > last.dump
+        fi
+    fi
+
+    records_list=$(echo "$records_list" | sed '/^$/d')
+
+    if ( "$dont_download" ); then
+        local cols=$(tput cols)
+        local totalnum=$(echo "$records_list" | wc -l)
+        echo -e "\nList of all records to be downloaded: "
+        while [[ $x -lt $cols ]]; do echo -n '='; let x=$x+1; done; x=0;
+        echo "$records_list" | column -t -s "|"
+        while [[ $x -lt $cols ]]; do echo -n '='; let x=$x+1; done; x=0;
+        echo "Total records count to download: $totalnum"
+        exit 0
+    fi
+
+    notify "Downloading records"
+    while read -r record; do
+        author=$(echo "$record" | awk -F '|' '{print $1}')
+        name=$(echo "$record" | awk -F '|' '{print $2}')
+        link=$(echo "$record" | awk -F '|' '{print $3}')
+        filename="${author} - ${name}.mp3"
+        if [[ -f "$filename" ]]; then
+            if ("$force_override"); then
+                notify "Overriding: ${filename}"
+                downloadRecord "$filename" "$link"
+            else
+                notify "Skipping: ${filename}"
+            fi
+        else
+            notify "Downloading: ${filename}"
+            downloadRecord "$filename" "$link"
+        fi
+        session_downloaded_records+="$record"$'\n'
+    done <<< "$records_list"
+} # }}}
+
+trap emergStop TERM INT
+trap normalStop EXIT QUIT
+
+PARSEDOPTS=$(getopt -n "$0" \
+    -o h,o,O,N,e:,p:,d:,P:,f:,q \
+    --long "help,osdnotify,email:,password:,directory:,override,proxy:,\
+            notreally,from-url:,sync,quite,group:,user:,playlist:" \
+    -- "$@"
+)
+
+[[ "$?" -ne 0 ]] \
+    && die "Error parsing command line args. See --help for available options."
+
+eval set -- "$PARSEDOPTS"
+
+while true; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            shift;;
+        -e|--email)
+            u_mail="$2"
+            shift 2;;
+        -p|--password)
+            u_password="$2"
+            shift 2;;
+        -d|--directory)
+            dump_directory="$2"
+            dump_directory="${dump_directory%/}"
+            shift 2;;
+        -O|--override)
+            force_override=true
+            shift ;;
+        -q|--quite)
+            flag_quite=true
+            shift ;;
+        -P|--proxy)
+            [[ ! $2 =~ ^http(s)?:\/\/(.+:.+@)?[A-Za-z\.0-9-]{1,}.[A-Za-z]{1,}:[0-9]{1,}$ ]] \
+                && die "Bad proxy specified!"
+            proxy_string="$2"
+            shift 2;;
+        -N|--notreally)
+            dont_download=true
+            shift ;;
+        -f|--from-url)
+            [[ ! $2 =~ ^http(s)?:\/\/vk(ontakte)?.(com|ru)\/ ]] \
+                && die "Bad URL specified"
+            download_uri=$(echo "$2" | \
+                sed 's/^\(http:\/\/\|https:\/\/\)[A-Za-z]*.[A-Za-z]*\///')
+            shift 2;;
+        -o|--osdnotify)
+            osdnotify=true
+            shift;;
+        --sync)
+            flag_sync=true
+            shift;;
+        --group)
+            group="$2"
+            shift 2;;
+        --user)
+            name_or_id="$2"
+            shift 2;;
+        --playlist)
+            album="$2"
+            [[ ! $2 =~ ^[0-9]*$ ]] \
+                && die "Bad playlist id specified. See --help for details"
+            shift 2;;
+        --cookie)
+            cookie_file="$2"
+            shift 2;;
+        --)
+            shift
+            break;;
+        esac
+done
+
+main
