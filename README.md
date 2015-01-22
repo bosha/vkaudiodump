@@ -1,4 +1,4 @@
-Загрузка музыкальных записей из соц. сети ВКонтакте
+vkAudioDump
 =====
 
 ## About ##
@@ -91,15 +91,8 @@ Total records count to download: 651
 * Без авторизации: http://hostname.com:3128
 
 ```bash
-user@hostname:~$ vkAudioDump --email test@mail.com --password 'testpassword'
-*Using specified proxy*
-Authorizing on vk.com ..
-No previous authorization found. Authorizing again..
-Gettings records list
-Downloading current user records
-Converting records list..
-Downloading records
-Downloading: Joe Cocker - Unchain My Heart.mp3
+user@hostname:~$ vkAudioDump --email test@mail.com --password 'testpassword' --proxy "http://user:superpassword@superhost.com:3128"
+Using specified proxy
 .....
 ```
 
